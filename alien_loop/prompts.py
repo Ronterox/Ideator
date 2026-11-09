@@ -292,3 +292,51 @@ SUBMIT_COACHING_TOOL = {
         "additionalProperties": False,
     },
 }
+
+# ---------------------------------------------------------------------------
+# Simplifier: plain-language version of the top ideas, shown by `ideator report`.
+# ---------------------------------------------------------------------------
+
+SIMPLIFY_SYSTEM = """You turn dense research-idea write-ups into a short, digestible summary for the person who asked for them. They are an expert in their own project but not in the distant fields the ideas borrow from.
+
+For each idea write:
+- borrowed_from: the field or practice it borrows from, in a few words (e.g. "eyewitness-memory research"), or "" if it borrows from nothing in particular.
+- tldr: a single plain sentence of at most 15 words saying what the idea does, shown as a subtitle right above the summary (e.g. "Stay silent when checks pass, so the model's confidence stays honest.").
+- plain_summary: one or two sentences, at most 50 words, in plain words and concrete to their problem: what the harness or experiment would actually do, and which of their stated problems it targets. Do not oversell, and keep the idea's meaning exactly.
+
+The reader sees the idea's original title right above your summary, and the title stays as it is. So reuse the title's key words in the summary, so they can map each part of the title to its plain meaning. When the title uses a borrowed or technical term (e.g. "loss-development triangle", "soft-decision decoding"), use that same term and say in plain words what it means here. Do not swap it for a synonym or leave it out.
+
+Call submit_simplified exactly once, covering every idea id."""
+
+SIMPLIFY_TASK = """THE PROBLEM (in the words of the person asking)
+{question}
+
+TOP IDEAS, IN RANK ORDER
+{ideas}"""
+
+SUBMIT_SIMPLIFIED_TOOL = {
+    "name": "submit_simplified",
+    "description": "Submit the plain-language summary. Call exactly once.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ideas": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "idea_id": {"type": "string"},
+                        "borrowed_from": {"type": "string"},
+                        "tldr": {"type": "string"},
+                        "plain_summary": {"type": "string"},
+                    },
+                    "required": ["idea_id", "borrowed_from", "tldr", "plain_summary"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["ideas"],
+        "additionalProperties": False,
+    },
+}

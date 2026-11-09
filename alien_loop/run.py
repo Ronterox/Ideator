@@ -88,6 +88,39 @@ def strip_leaks(text: str) -> str:
     return " ".join(s for s in sentences if not LEAK_RE.search(s))
 
 
+def simplify_ideas(client, tracker: CostTracker, log, question: str, top: list[dict], use_fallbacks: bool = True) -> None:
+    """Opus rewrites the content of `top` (ranked ideas) in plain words, storing idea["simple"]. Titles stay as they are."""
+    text = "\n\n".join(
+        f"[{i['id']}] #{i['rank']} {i['title']}\nSummary: {i['summary']}\nKey mechanism: {i['key_mechanism']}" for i in top
+    )
+    result = run_agent(
+        client, model=CRITIC_MODEL, system=P.SIMPLIFY_SYSTEM,
+        user_text=P.SIMPLIFY_TASK.format(question=question, ideas=text),
+        submit_tool=P.SUBMIT_SIMPLIFIED_TOOL, tracker=tracker, role="simplifier", log=log,
+        effort="medium", max_turns=2, use_fallbacks=use_fallbacks,
+    )
+    by_id = {norm_id(x["idea_id"]): x for x in result["ideas"]}
+    for i in top:
+        x = by_id.get(norm_id(i["id"]))
+        if x:
+            i["simple"] = {k: x[k] for k in ("borrowed_from", "tldr", "plain_summary")}
+    log(f"simplified {sum('simple' in i for i in top)}/{len(top)} ideas")
+
+
+def summary_md(topic: str, ranked: list[dict], av: str, co: str, top: int) -> str:
+    """The digestible view: original titles, plain-language content. Uniqueness = 10 - availability."""
+    md = [f"# {topic or 'Ideation run'}: top ideas\n",
+          "Scores out of 10, higher is better: **uniqueness** (how few experts would come up with it) "
+          "and **coherence** (how well it holds together).\n"]
+    for i in ranked[:top]:
+        s = i.get("simple")
+        borrowed = f" *(borrowed from {s['borrowed_from']})*" if s and s["borrowed_from"] else ""
+        tldr = f"*{s['tldr']}*  \n" if s and s.get("tldr") else ""
+        md.append(f"**{i['rank']}. {i['title']}**{borrowed}  \nuniqueness {10 - i[av]} · coherence {i[co]}  \n"
+                  f"{tldr}{s['plain_summary'] if s else i['summary']}\n")
+    return "\n".join(md)
+
+
 def write_atomic(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
@@ -275,15 +308,33 @@ class Loop:
         log(f"topic '{a.topic or '-'}' · repo {self.repo.root} · {a.iterations} rounds × {len(self.generators)} generators")
         log(f"run folder {self.out}")
         log(f"{len(self.prior)} ideas carried over from earlier runs" + (" (use --no-carry to ignore them)" if self.prior else ""))
+        ranked = False
         try:
             for round_no in range(1, a.iterations + 1):
                 if not self.round(round_no):
                     break
             self.final_pass()
-        finally:  # whatever happened, rank and report what we paid for
             self.rank()
+            ranked = True
+            self.simplify()
+        finally:  # whatever happened, rank and report what we paid for
+            if not ranked:
+                self.rank()
             self.save()
             self.report()
+
+    # ---------------------------------------------------------------- plain-language pass
+    def simplify(self) -> None:
+        """Opus rewrites the top ideas in plain words; `ideator report` shows this version."""
+        top = sorted((i for i in self.ideas if "rank" in i), key=lambda i: i["rank"])[: self.args.simplify_top]
+        if not top:
+            return
+        log = self.events.logger("simplifier")
+        self.events.emit("ideator", f"PLAIN-LANGUAGE PASS: top {len(top)} ideas", "round")
+        try:
+            simplify_ideas(self.client, self.tracker, log, self.args.question, top, use_fallbacks=not self.args.no_fallbacks)
+        except Exception as exc:  # the explicit report still exists; the simple view just falls back to it
+            log(f"FAILED: {type(exc).__name__}: {exc}")
 
     def round(self, round_no: int) -> bool:
         a = self.args
@@ -411,11 +462,14 @@ class Loop:
         md.append("## Cost\n\n" + self.tracker.table() + "\n")
         write_atomic(self.out / "report.md", "\n".join(md))
 
+        write_atomic(self.out / "summary.md", summary_md(a.topic, ranked, av, co, a.simplify_top))
         if ranked:
             self.events.emit("ideator", f"TOP {min(a.top_k, len(ranked))} IDEAS", "round")
         for i in ranked[: a.top_k]:
-            self.events.emit("ideator", f"{i['rank']}. [{i['score']:+.2f} · avail {i[av]} · coh {i[co]}] {i['title']}  ({i['generator']}, r{i['round']})", "summary")
-        self.events.emit("ideator", f"report {self.out / 'report.md'}")
+            self.events.emit("ideator", f"{i['rank']}. [uniqueness {10 - i[av]} · coherence {i[co]}] {i['title']}  ({i['generator']}, r{i['round']})", "summary")
+        self.events.emit("ideator", f"summary {self.out / 'summary.md'} · full report {self.out / 'report.md'}")
+
+
 
 
 def load_dotenv(path: Path) -> None:
@@ -442,6 +496,7 @@ def main() -> None:
     p.add_argument("--ideas", type=int, default=3, help="Ideas per generator per round.")
     p.add_argument("--beta", type=float, default=0.7, help="Weight on unavailability in the final ranking.")
     p.add_argument("--top-k", type=int, default=5)
+    p.add_argument("--simplify-top", type=int, default=10, help="How many top ideas the plain-language pass rewrites.")
     p.add_argument("--gen-searches", type=int, default=4, help="Max web searches per generator per round.")
     p.add_argument("--critic-searches", type=int, default=6, help="Max web searches for the critic per round.")
     p.add_argument("--final-searches", type=int, default=5, help="Max web searches in the final rescoring pass.")

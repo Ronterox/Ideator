@@ -4,7 +4,8 @@
                                                                          start a run and follow it
   ideator follow [RUN]                                                   live colored log of a run
   ideator list                                                           all runs with status and cost
-  ideator report [RUN] [--page]                                          top ideas (or page the full report)
+  ideator report [RUN] [--explicit] [--page]                             top ideas in plain words (or the full report)
+  ideator simplify [RUN]                                                 add the plain-language view to an older run
   ideator stop [RUN]                                                     stop a run (it still ranks and reports)
 
 RUN is a run folder name, a unique prefix of one, or omitted for the latest run.
@@ -144,6 +145,17 @@ def _follow(run_dir: Path, from_start: bool = True) -> int:
         return 0
 
 
+def load_state(run_dir: Path) -> dict:
+    try:
+        return json.loads((run_dir / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        sys.exit(f"{run_dir.name} has no results yet (status: {run_status(run_dir)})")
+
+
+def ranked_ideas(state: dict) -> list[dict]:
+    return sorted((i for i in state.get("ideas", []) if "rank" in i), key=lambda i: i["rank"])
+
+
 def cmd_follow(args) -> int:
     run_dir = resolve_run(args.run)
     status = run_status(run_dir)
@@ -175,11 +187,34 @@ def cmd_list(args) -> int:
             pass
         cost = ev.get("cost", state.get("cost_usd", 0.0))
         ideas = state.get("ideas", [])
-        top = next((i["title"] for i in sorted(ideas, key=lambda i: i.get("rank", 1e9)) if "rank" in i), "")
+        best = next((i for i in sorted(ideas, key=lambda i: i.get("rank", 1e9)) if "rank" in i), None)
+        top = best["title"] if best else ""
         when = fmt_elapsed(elapsed) if elapsed else "–"
         print(f"{d.name:<36} {colors.get(status, DIM)}{status:<9}{RESET} {when:>8} "
               f"${cost:>6.2f} {len(ideas):>5}  {top[:70]}")
     return 0
+
+
+def score_keys(ranked: list[dict]) -> tuple[str, str]:
+    av = "final_availability" if any("final_availability" in i for i in ranked) else "availability"
+    return av, ("final_coherence" if av.startswith("final") else "coherence")
+
+
+def show_simple(run_dir: Path, top: int) -> None:
+    """Plain-language top ideas (from the simplifier pass); falls back to the explicit text when missing."""
+    state = load_state(run_dir)
+    ranked = ranked_ideas(state)
+    av, co = score_keys(ranked)
+    print(f"{BOLD}{run_dir.name}{RESET} · {run_status(run_dir)} · ${state.get('cost_usd', 0):.2f} · {len(state['ideas'])} ideas\n")
+    print(f"{DIM}Out of 10, higher is better: uniqueness (how few experts would come up with it) · coherence{RESET}\n")
+    for i in ranked[:top]:
+        s = i.get("simple")
+        borrowed = f" {DIM}(from {s['borrowed_from']}){RESET}" if s and s["borrowed_from"] else ""
+        print(f"{BOLD}{i['rank']:>2}. {i['title']}{RESET}{borrowed}")
+        print(f"    {CYAN}uniqueness {10 - i[av]} · coherence {i[co]}{RESET}")
+        if s and s.get("tldr"):
+            print(f"    {YELLOW}{BOLD}{s['tldr']}{RESET}")
+        print(f"    {s['plain_summary'] if s else i['summary']}\n")
 
 
 def cmd_report(args) -> int:
@@ -188,17 +223,49 @@ def cmd_report(args) -> int:
     if not report.exists():
         sys.exit(f"{run_dir.name} has no report yet (status: {run_status(run_dir)})")
     if args.page:
-        return subprocess.call(["less", "-R", str(report)])
+        summary = run_dir / "summary.md"
+        return subprocess.call(["less", "-R", str(report if args.explicit or not summary.exists() else summary)])
+    if not args.explicit:
+        show_simple(run_dir, args.top)
+        print(f"{DIM}Full detail: ideator report {run_dir.name} --explicit{RESET}")
+        return 0
     state = json.loads((run_dir / "state.json").read_text())
     ranked = sorted((i for i in state["ideas"] if "rank" in i), key=lambda i: i["rank"])
-    av = "final_availability" if any("final_availability" in i for i in ranked) else "availability"
-    co = "final_coherence" if av.startswith("final") else "coherence"
+    av, co = score_keys(ranked)
     print(f"{BOLD}{run_dir.name}{RESET} · {run_status(run_dir)} · ${state.get('cost_usd', 0):.2f} · {len(state['ideas'])} ideas\n")
     for i in ranked[: args.top]:
         print(f"{BOLD}{i['rank']}. {i['title']}{RESET}")
         print(f"   {DIM}score {i['score']:+.2f} · availability {i.get(av)} · coherence {i.get(co)} · {i['generator']} r{i['round']}{RESET}")
         print(f"   {i['summary']}\n")
-    print(f"Full report: {report}\n{DIM}(ideator report --page to read it here){RESET}")
+    print(f"Full report: {report}\n{DIM}(ideator report --explicit --page to read it here){RESET}")
+    return 0
+
+
+def cmd_simplify(args) -> int:
+    """Run the plain-language pass on an existing run (e.g. one made before the pass existed)."""
+    import anthropic
+
+    from .llm import CostTracker
+    from .run import load_dotenv, simplify_ideas, summary_md, write_atomic
+
+    run_dir = resolve_run(args.run)
+    if run_status(run_dir) == "running":
+        sys.exit(f"{run_dir.name} is still running; it simplifies itself when it finishes")
+    state = load_state(run_dir)
+    top = ranked_ideas(state)[: args.top]
+    if not top:
+        sys.exit(f"{run_dir.name} has no ranked ideas to simplify")
+    load_dotenv(ROOT / ".env")
+    tracker = CostTracker()
+    print(f"Simplifying the top {len(top)} ideas of {run_dir.name} with Opus…")
+    simplify_ideas(anthropic.Anthropic(max_retries=4), tracker, lambda m, k=None: print(f"{DIM}{m}{RESET}"),
+                   state["question"], top)
+    state.pop("overview", None)
+    state["cost_usd"] = round(state.get("cost_usd", 0) + tracker.cost(), 4)
+    write_atomic(run_dir / "state.json", json.dumps(state, indent=2, ensure_ascii=False, default=str))
+    write_atomic(run_dir / "summary.md", summary_md(state.get("topic", ""), ranked_ideas(state), *score_keys(top), len(top)))
+    print(f"{DIM}cost ${tracker.cost():.2f}{RESET}\n")
+    show_simple(run_dir, top=len(top))
     return 0
 
 
@@ -234,11 +301,17 @@ def main() -> None:
 
     sub.add_parser("list", help="all runs with status and cost").set_defaults(func=cmd_list)
 
-    r = sub.add_parser("report", help="top ideas of a run")
+    r = sub.add_parser("report", help="top ideas of a run, in plain words")
     r.add_argument("run", nargs="?")
     r.add_argument("--top", type=int, default=5)
-    r.add_argument("--page", action="store_true", help="page through the full markdown report")
+    r.add_argument("--explicit", action="store_true", help="the full write-up of each idea instead of the plain version")
+    r.add_argument("--page", action="store_true", help="page through the markdown (summary, or full report with --explicit)")
     r.set_defaults(func=cmd_report)
+
+    sp = sub.add_parser("simplify", help="add the plain-language version to an older run")
+    sp.add_argument("run", nargs="?")
+    sp.add_argument("--top", type=int, default=10)
+    sp.set_defaults(func=cmd_simplify)
 
     s = sub.add_parser("stop", help="stop a run gracefully")
     s.add_argument("run", nargs="?")
