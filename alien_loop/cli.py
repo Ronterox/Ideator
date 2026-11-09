@@ -285,7 +285,8 @@ def cmd_list(args) -> int:
             state = json.loads((d / "state.json").read_text())
         except (OSError, json.JSONDecodeError):
             pass
-        cost = ev.get("cost", state.get("cost_usd", 0.0))
+        # results include later passes (e.g. ideator simplify); the live log only covers the run itself
+        cost = state["cost_usd"] if status != "running" and "cost_usd" in state else ev.get("cost", 0.0)
         ideas = state.get("ideas", [])
         best = next((i for i in sorted(ideas, key=lambda i: i.get("rank", 1e9)) if "rank" in i), None)
         top = best["title"] if best else ""
