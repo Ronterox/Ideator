@@ -144,6 +144,21 @@ class Loop:
         self.out.mkdir(parents=True, exist_ok=True)
         self.events = EventLog(self.out, self.tracker, echo=sys.stdout.isatty())
         self.prior = [] if args.no_carry else load_prior_ideas(self.out.parent, args.topic, args.question, self.out)
+        liked = json.loads(Path(args.liked_file).read_text()) if args.liked_file else {}
+        self.liked: list[dict] = liked.get("ideas", [])
+        self.liked_note: str = liked.get("note", "")
+        if args.resume_from:  # continue a topic: generators start from the parent run's evolved prompts
+            parent = json.loads(Path(args.resume_from).read_text())
+            for g in self.generators:
+                if parent.get("prompts", {}).get(g["id"]):
+                    g["system"] = parent["prompts"][g["id"]][-1]
+                    g["prompts"] = [g["system"]]
+
+    def liked_text(self) -> str:
+        lines = [f"- {i['title']}\n  {i['summary']}\n  Key mechanism: {i['key_mechanism']}" for i in self.liked]
+        if self.liked_note:
+            lines.append(f"Their note on why: {self.liked_note}")
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------- generate
     def generate(self, gen: dict, round_no: int) -> list[dict]:
@@ -154,6 +169,7 @@ class Loop:
             n_ideas=self.args.ideas,
             taken_block=P.TAKEN_BLOCK.format(taken="\n".join(idea_line(i) for i in taken)) if taken else "",
             feedback_block=P.FEEDBACK_BLOCK.format(feedback=gen["feedback"]) if gen["feedback"] else "",
+            liked_block=P.LIKED_BLOCK.format(liked=self.liked_text()) if self.liked else "",
         )
         log(f"generating with {gen['model']}")
         result = run_agent(
@@ -232,7 +248,10 @@ class Loop:
             f"Reviewer note: {i['uniqueness_feedback']}"
             for i in mine
         )
-        user = P.COACH_TASK.format(gen_id=gen["id"], system_prompt=gen["system"], ideas_with_findings=findings)
+        user = P.COACH_TASK.format(
+            gen_id=gen["id"], system_prompt=gen["system"], ideas_with_findings=findings,
+            liked_block=P.COACH_LIKED_BLOCK.format(liked=self.liked_text()) if self.liked else "",
+        )
         coach_args = dict(
             model=self.args.coach_model, system=P.COACH_SYSTEM, submit_tool=P.SUBMIT_COACHING_TOOL, tracker=self.tracker, role="coach",
             log=log, effort="medium", max_turns=3, use_fallbacks=not self.args.no_fallbacks,
@@ -308,6 +327,8 @@ class Loop:
         log(f"topic '{a.topic or '-'}' · repo {self.repo.root} · {a.iterations} rounds × {len(self.generators)} generators")
         log(f"run folder {self.out}")
         log(f"{len(self.prior)} ideas carried over from earlier runs" + (" (use --no-carry to ignore them)" if self.prior else ""))
+        if self.liked:
+            log(f"steering toward {len(self.liked)} liked idea(s): " + " | ".join(i["title"] for i in self.liked))
         ranked = False
         try:
             for round_no in range(1, a.iterations + 1):
@@ -403,6 +424,7 @@ class Loop:
             "ideas": self.ideas, "coaching": self.coaching,
             "prompts": {g["id"]: g["prompts"] for g in self.generators}, "prior_ideas": len(self.prior),
             "usage": self.tracker.by_model, "cost_usd": round(self.tracker.cost(), 4),
+            "liked": self.liked, "liked_note": self.liked_note,
         }
         write_atomic(self.out / "state.json", json.dumps(state, indent=2, ensure_ascii=False, default=str))
 
@@ -497,6 +519,8 @@ def main() -> None:
     p.add_argument("--beta", type=float, default=0.7, help="Weight on unavailability in the final ranking.")
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--simplify-top", type=int, default=10, help="How many top ideas the plain-language pass rewrites.")
+    p.add_argument("--liked-file", help="JSON {ideas: [...], note: str} of ideas the person liked; steers generators and coach.")
+    p.add_argument("--resume-from", help="state.json of a parent run; generators start from its evolved prompts.")
     p.add_argument("--gen-searches", type=int, default=4, help="Max web searches per generator per round.")
     p.add_argument("--critic-searches", type=int, default=6, help="Max web searches for the critic per round.")
     p.add_argument("--final-searches", type=int, default=5, help="Max web searches in the final rescoring pass.")

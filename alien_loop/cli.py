@@ -4,6 +4,7 @@
                                                                          start a run and follow it
   ideator follow [RUN]                                                   live colored log of a run
   ideator list                                                           all runs with status and cost
+  ideator continue [RUN] [--like 1 3] [--note WHY]                       new run steered toward ideas you liked
   ideator report [RUN] [--explicit] [--page]                             top ideas in plain words (or the full report)
   ideator simplify [RUN]                                                 add the plain-language view to an older run
   ideator stop [RUN]                                                     stop a run (it still ranks and reports)
@@ -11,6 +12,7 @@
 RUN is a run folder name, a unique prefix of one, or omitted for the latest run.
 If DESCRIPTION is omitted, it is read from --file, from piped stdin, or typed interactively.
 Ctrl-C while following only detaches; the run keeps going in the background.
+When a run you are following finishes, ideator asks which ideas you liked and can continue from them.
 """
 
 import argparse
@@ -106,44 +108,68 @@ def cmd_new(args) -> int:
     if repo and not repo.is_dir():
         sys.exit(f"--repo is not a directory: {repo}")
     topic = args.topic or (slug(repo.name) if repo else slug(" ".join(description.split()[:5])))
+    run_dir = launch(description, repo, topic, args.rounds, args.extra, no_carry=args.no_carry)
+    return started(run_dir, args.no_follow)
 
+
+def launch(description: str, repo: Path | None, topic: str, rounds: int, extra: list[str], *,
+           no_carry: bool = False, liked: dict | None = None, parent: Path | None = None) -> Path:
+    """Create the run folder and start alien_loop.run detached. Returns the run folder."""
     run_dir = RUNS / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{topic}"
     run_dir.mkdir(parents=True)
     (run_dir / "problem.md").write_text(description + "\n")
 
     cmd = [sys.executable, "-m", "alien_loop.run", "--run-dir", str(run_dir), "--topic", topic,
-           "--question-file", str(run_dir / "problem.md"), "--iterations", str(args.rounds)]
+           "--question-file", str(run_dir / "problem.md"), "--iterations", str(rounds)]
+    if liked:
+        (run_dir / "liked.json").write_text(json.dumps(liked, indent=2, ensure_ascii=False))
+        cmd += ["--liked-file", str(run_dir / "liked.json")]
+    if parent and (parent / "state.json").exists():
+        cmd += ["--resume-from", str(parent / "state.json")]
     if repo:
         cmd += ["--repo", str(repo)]
     else:  # no repo: give the generators an empty folder, so they rely on the description and the web
         empty = run_dir / "no-repo"
         empty.mkdir()
         cmd += ["--repo", str(empty)]
-    if args.no_carry:
+    if no_carry:
         cmd.append("--no-carry")
-    cmd += args.extra
+    cmd += extra
 
     with (run_dir / "stdout.log").open("w") as log:
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 start_new_session=True, env={**os.environ, "PYTHONPATH": str(ROOT)})
-    meta = {"pid": proc.pid, "started": time.time(), "topic": topic, "repo": str(repo or ""), "command": cmd}
+    meta = {"pid": proc.pid, "started": time.time(), "topic": topic, "repo": str(repo or ""), "command": cmd,
+            "parent": parent.name if parent else None}
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    return run_dir
 
-    print(f"{GREEN}{BOLD}Started{RESET} run {BOLD}{run_dir.name}{RESET} (pid {proc.pid})")
+
+def started(run_dir: Path, no_follow: bool) -> int:
+    pid = read_meta(run_dir).get("pid")
+    print(f"{GREEN}{BOLD}Started{RESET} run {BOLD}{run_dir.name}{RESET} (pid {pid})")
     print(f"{DIM}Follow later: ideator follow {run_dir.name} · stop: ideator stop {run_dir.name}{RESET}\n")
-    if args.no_follow:
+    if no_follow:
         return 0
-    return _follow(run_dir)
+    code = _follow(run_dir)
+    if code is None:  # detached
+        return 0
+    if code == 0 and sys.stdin.isatty() and sys.stdout.isatty():
+        return interactive(run_dir)
+    return code
 
 
-def _follow(run_dir: Path, from_start: bool = True) -> int:
+def _follow(run_dir: Path, from_start: bool = True) -> int | None:
+    """Follow until the run ends (0 finished, 1 otherwise); None if the user detached with Ctrl-C."""
     try:
         return follow(run_dir, from_start=from_start)
     except KeyboardInterrupt:
         sys.stdout.write("\r\033[K")
         print(f"{YELLOW}Detached.{RESET} The run keeps going: ideator follow {run_dir.name}")
-        return 0
+        return None
 
+
+# ---------------------------------------------------------------- liking ideas and continuing
 
 def load_state(run_dir: Path) -> dict:
     try:
@@ -154,6 +180,80 @@ def load_state(run_dir: Path) -> dict:
 
 def ranked_ideas(state: dict) -> list[dict]:
     return sorted((i for i in state.get("ideas", []) if "rank" in i), key=lambda i: i["rank"])
+
+
+def continue_run(parent: Path, picks: list[int], note: str, rounds: int, extra: list[str], no_follow: bool) -> int:
+    """Start a run on the parent's problem, repo and topic, steered toward the picked ideas (by rank)."""
+    state, meta = load_state(parent), read_meta(parent)
+    by_rank = {i["rank"]: i for i in ranked_ideas(state)}
+    missing = [n for n in picks if n not in by_rank]
+    if missing:
+        sys.exit(f"No idea ranked {', '.join(map(str, missing))} in {parent.name} (it has {len(by_rank)} ranked ideas)")
+
+    liked = list(state.get("liked", []))  # likes accumulate across continuations
+    seen = {i["title"] for i in liked}
+    for n in picks:
+        i = by_rank[n]
+        if i["title"] not in seen:
+            liked.append({k: i[k] for k in ("title", "summary", "key_mechanism")} | {"rank": n, "run": parent.name})
+            seen.add(i["title"])
+    notes = [x for x in (state.get("liked_note", ""), note.strip()) if x]
+
+    problem_file = parent / "problem.md"
+    description = problem_file.read_text().strip() if problem_file.exists() else state["question"]
+    repo_str = meta["repo"] if "repo" in meta else state.get("repo", "")
+    repo = Path(repo_str) if repo_str and Path(repo_str).name != "no-repo" else None
+    topic = state.get("topic") or meta.get("topic") or slug(parent.name)
+
+    run_dir = launch(description, repo, topic, rounds, extra, liked={"ideas": liked, "note": "; ".join(notes)}, parent=parent)
+    print(f"Continuing {BOLD}{topic}{RESET} from {parent.name}, steered by {len(liked)} liked idea(s).")
+    return started(run_dir, no_follow)
+
+
+def ask(prompt: str) -> str | None:
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def interactive(run_dir: Path) -> int:
+    """After a run: show the plain-language top ideas, ask which were liked, continue from them."""
+    print()
+    show_simple(run_dir, top=10)
+    count = len(ranked_ideas(load_state(run_dir)))
+    while True:
+        answer = ask(f"{BOLD}Which ideas did you like?{RESET} Numbers like '1 3', Enter to stop: ")
+        if not answer:
+            print(f"{DIM}Continue later with: ideator continue {run_dir.name} --like 1 3{RESET}")
+            return 0
+        try:
+            picks = sorted({int(x) for x in answer.replace(",", " ").split()})
+        except ValueError:
+            print("Please type rank numbers separated by spaces.")
+            continue
+        if not picks or any(n < 1 or n > count for n in picks):
+            print(f"Pick numbers between 1 and {count}.")
+            continue
+        break
+    note = ask("What did you like about them? (optional, helps steer; Enter to skip): ") or ""
+    rounds_answer = ask("Rounds for the next run [4]: ")
+    if rounds_answer is None:
+        return 0
+    rounds = int(rounds_answer) if rounds_answer.isdigit() and int(rounds_answer) > 0 else 4
+    return continue_run(run_dir, picks, note, rounds, [], no_follow=False)
+
+
+def cmd_continue(args) -> int:
+    run_dir = resolve_run(args.run)
+    if run_status(run_dir) == "running":
+        sys.exit(f"{run_dir.name} is still running; wait for it to finish (ideator follow {run_dir.name})")
+    if not args.like:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            sys.exit("Say which ideas you liked: ideator continue RUN --like 1 3")
+        return interactive(run_dir)
+    return continue_run(run_dir, sorted(set(args.like)), args.note or "", args.rounds, args.extra, args.no_follow)
 
 
 def cmd_follow(args) -> int:
@@ -227,7 +327,7 @@ def cmd_report(args) -> int:
         return subprocess.call(["less", "-R", str(report if args.explicit or not summary.exists() else summary)])
     if not args.explicit:
         show_simple(run_dir, args.top)
-        print(f"{DIM}Full detail: ideator report {run_dir.name} --explicit{RESET}")
+        print(f"{DIM}Full detail: ideator report {run_dir.name} --explicit · liked some? ideator continue {run_dir.name} --like 1 3{RESET}")
         return 0
     state = json.loads((run_dir / "state.json").read_text())
     ranked = sorted((i for i in state["ideas"] if "rank" in i), key=lambda i: i["rank"])
@@ -300,6 +400,14 @@ def main() -> None:
     f.set_defaults(func=cmd_follow)
 
     sub.add_parser("list", help="all runs with status and cost").set_defaults(func=cmd_list)
+
+    c = sub.add_parser("continue", help="new run on the same topic, steered toward ideas you liked")
+    c.add_argument("run", nargs="?")
+    c.add_argument("-l", "--like", type=int, nargs="+", metavar="RANK", help="ranks of the ideas you liked (asks if omitted)")
+    c.add_argument("--note", help="what you liked about them; passed to the generators and the coach")
+    c.add_argument("-n", "--rounds", type=int, default=4)
+    c.add_argument("--no-follow", action="store_true", help="start in the background and return")
+    c.set_defaults(func=cmd_continue)
 
     r = sub.add_parser("report", help="top ideas of a run, in plain words")
     r.add_argument("run", nargs="?")

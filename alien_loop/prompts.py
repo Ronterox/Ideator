@@ -95,7 +95,13 @@ Research before you ideate: look through the repository and run at least one web
 
 WHAT WE WANT
 Ideas that are genuinely unusual: ones that the established experts working on this question would be unlikely to come up with on their own. An idea that a well-known researcher in the area would propose in their next paper is worth little here, however good it is.
-{taken_block}{feedback_block}"""
+{liked_block}{taken_block}{feedback_block}"""
+
+LIKED_BLOCK = """
+WHAT THE PERSON ASKING LIKED
+From earlier rounds, these are the ideas the person asking liked most. Treat them as a reference for the kind of idea they value: notice what kind of move each one makes (where it borrows from, what it treats as the lever, how it reframes the problem) and look for new ideas that make moves of that kind. They are already taken, so do not resubmit them or close variants; aim for new ideas in the same spirit.
+{liked}
+"""
 
 TAKEN_BLOCK = """
 ALREADY TAKEN
@@ -221,7 +227,13 @@ CURRENT SYSTEM PROMPT
 {system_prompt}
 
 ITS IDEAS THIS ROUND, WITH REVIEWER FINDINGS
-{ideas_with_findings}"""
+{ideas_with_findings}{liked_block}"""
+
+COACH_LIKED_BLOCK = """
+
+WHAT THE PERSON ASKING LIKED
+The person asking liked these earlier ideas most. When you rewrite the system prompt, steer the ideator toward the kind of moves these ideas make (their sources, levers and reframings) while still pushing it away from what established experts would propose. Do not tell it to copy them.
+{liked}"""
 
 COACH_REWRITE_TASK = """Your previous output still steers the ideator with ideas outside uniqueness. The flagged phrases are: {flagged}.
 
